@@ -1,10 +1,31 @@
 services:
-  api:
+  # 两个 API 实例共用同一 SQLite 卷（archaeo-data -> /data/archaeo.db）。
+  # 任一端 /docs 都可登记、撤销对接和叠压；写事务按提交顺序串行，
+  # 回包留存跨实例、跨重启可按（遗址, version）取回。
+  api1:
     build: .
     image: archaeo-strata-api:latest
-    container_name: archaeo-strata-api
+    container_name: archaeo-strata-api-1
     ports:
       - "8000:8000"
+    environment:
+      DB_PATH: /data/archaeo.db
+    volumes:
+      - archaeo-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sqlite3; sqlite3.connect(os.environ['DB_PATH']).execute('SELECT 1 FROM meta')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  api2:
+    build: .
+    image: archaeo-strata-api:latest
+    container_name: archaeo-strata-api-2
+    ports:
+      - "8001:8000"
     environment:
       DB_PATH: /data/archaeo.db
     volumes:

@@ -14,13 +14,14 @@
 
 ```bash
 docker compose up --build
-# API:      http://localhost:8000
-# Swagger:  http://localhost:8000/docs   （可直接在页面上录入数据）
-# ReDoc:    http://localhost:8000/redoc
+# 实例 1:  http://localhost:8000/docs
+# 实例 2:  http://localhost:8001/docs   （两个实例共用同一 SQLite 卷）
 ```
 
-SQLite 数据文件保存在命名卷 `archaeo-data`（容器内 `/data/archaeo.db`），
-`docker compose down` 不会删除；如需清空：`docker compose down -v`。
+compose 启动 **两个 API 实例**（`api1`、`api2`），挂载同一个命名卷
+`archaeo-data`（容器内 `/data/archaeo.db`）。任一端 `/docs` 都可登记、撤销
+对接和叠压；写事务按提交顺序串行核算，回包留存在两端都可取回。
+`docker compose down` 不会删除数据；如需清空：`docker compose down -v`。
 
 ## 本地裸跑
 
@@ -53,6 +54,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/superpositions/{id}` | 撤销叠压并重算 |
 | GET | `/sites/{id}/solution` | 整站分组、组间边、各组全部可行年代段 |
 | GET | `/strata/{id}/correlation-view` | 按原始层位查同组成员与可行年代段 |
+| GET | `/sites/{id}/responses/{version}` | 取回该次提交留存的完整回包（查无回包返回 404） |
 
 ### 录入示例
 
@@ -77,17 +79,37 @@ curl -X POST localhost:8000/sites/$SID/correlations \
 写入会在**同一事务**内先重算再提交。若新记录导致无解（`EMPTY_DOMAIN` /
 `GROUP_CYCLE` / `ORDER_CONFLICT`），事务回滚，接口返回 `409`，响应体包含：
 
-- `contradiction`：一组本身即矛盾的**原始记录见证**（层位年代段、对接、叠压，
-  含可读原因与记录 id，便于定位）；
-- `previous_solution`：回滚后库内已有对接与年代结论（保持可行、保持可用）。
+- `contradiction`：由**待录关系与校验时的旧记录**生成的一组本身即矛盾的
+  **原始记录见证**（层位年代段、对接、叠压，含可读原因与记录 id，便于定位）；
+- `previous_solution`：对应这份旧记录的求解结果（保持可行、保持可用）。
+
+拒绝时关系和版号照旧，也不留存回包。
+
+## 回包留存
+
+每次成功写入的完整回包（`record` 或 `deleted` + 本次提交的完整 `solution`，
+含 `version`）与关系变更、版号在**同一事务**中提交（`response_log` 表），
+写入失败则全部不生效。之后可在任一实例按遗址与版号取回：
+
+```bash
+curl localhost:8000/sites/1/responses/5   # 与当次一致的回包；查无回包返回 404
+```
+
+即使关系后来撤销、原实例已经重启，取回的仍是当次提交时的回包。
+注意与实时回包的区别：写接口返回的 `solution` 是提交后读取的最新已提交状态
+——刚登记的对接若在回包前被另一端撤销，登记回包会带上撤销后的分组；
+而留存回包永远对应它那一次提交。
 
 ## 一致性与并发
 
-- 所有写操作经进程内同一把锁串行化，按**提交顺序**核算；每次成功写入使全局
-  `version` 加 1，查询结果带 `version`，可据此确认读到的是哪一次已完成提交。
+- 写操作在进程内写锁 + SQLite `BEGIN IMMEDIATE` 下串行：两个实例共用同一
+  SQLite 卷时，校验（求解）与提交按**提交顺序**串行核算，不会出现
+  “校验后、提交前”被另一端改写。每次成功写入使全局 `version` 加 1。
+- 读操作走独立的只读连接与只读事务，**不进入写锁**：写事务未提交时，整站与
+  按层位查询直接返回最近一次已提交的同版分组、成员、年代与版号；提交之后
+  发起的新查询读到新版。
 - 分组与年代结论**不物化落库**，每次查询及重启都由原始记录现场求解；
-  原始记录由 SQLite 事务保证原子性，因此任何查询看到的分组/年代都来自同一次
-  完整提交，不存在半写入的中间态。
+  原始记录与回包留存由 SQLite 事务保证原子性，不存在半写入的中间态。
 - SQLite 启用 WAL 与外键约束，连接带 30s busy timeout。
 
 ## 求解算法（`app/solver.py`）
@@ -107,4 +129,6 @@ python -m pytest tests/ -q
 ```
 
 覆盖区间工具、缺口域求解、成环/空域/次序冲突及矛盾见证、40 层上限、
-无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复。
+无解拒绝与旧结论保留、撤销重算、并发写入串行化、重启后结论恢复、
+回包留存与按版号取回、跨实例共享与竞态、写事务未提交时的读一致性、
+旧库（无 response_log 表）平滑升级。

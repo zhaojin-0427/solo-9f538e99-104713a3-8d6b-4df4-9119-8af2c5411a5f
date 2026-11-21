@@ -1,8 +1,9 @@
 """SQLite 存储层：schema 初始化与仓储函数。
 
-派生结论（分组、可行年份）一律不落库，每次查询都由原始记录现场求解，
-因此“每次查询及重启后，分组和年代均来自同一次已完成的提交”由原始记录的
-事务原子性天然保证。
+派生结论（分组、可行年份）一律不落库，每次查询都由原始记录现场求解。
+唯一物化的是每次成功写入的回包（response_log）：它与关系变更、版号在同一
+事务中提交，因此任何实例（含重启后）都能按（遗址, version）取回与当次一致
+的回包；写入失败整体回滚，不留半提交状态。
 """
 
 from __future__ import annotations
@@ -61,6 +62,15 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 每次成功写入的回包留存：与关系变更、版号同事务提交
+CREATE TABLE IF NOT EXISTS response_log (
+    site_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (site_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
@@ -69,7 +79,11 @@ CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+    # isolation_level=None：自动提交模式，事务边界完全由本模块显式控制，
+    # 只读连接不会遗留打开的事务而钉住旧快照。
+    conn = sqlite3.connect(
+        db_path, check_same_thread=False, timeout=30.0, isolation_level=None
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -88,12 +102,34 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """写事务：BEGIN IMMEDIATE 立即取得 SQLite 写锁。
+
+    多个 API 实例共用同一数据库文件时，写事务因此按提交顺序串行；
+    校验（求解）在持锁期间完成，不会出现“校验后、提交前”被另一端改写。
+    任一环节失败整体回滚：关系变更、版号与回包留存都不生效。
+    """
+    conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-        conn.commit()
     except Exception:
         conn.rollback()
         raise
+    else:
+        conn.commit()
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """只读事务：固定一个已提交快照，保证一次查询内多步读取同版。
+
+    WAL 下只读事务既不阻塞写、也不被写阻塞：写事务未提交时读到的是
+    最近一次已提交状态；提交之后开启的新只读事务读到新版。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
 
 
 # ---------- meta / 版本号 ----------
@@ -286,3 +322,26 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 回包留存 ----------
+
+def store_response(
+    conn: sqlite3.Connection, site_id: int, version: int, payload: str
+) -> None:
+    """在写事务内留存本次提交的完整回包（JSON 文本）。"""
+    conn.execute(
+        "INSERT INTO response_log(site_id, version, payload) VALUES (?, ?, ?)",
+        (site_id, version, payload),
+    )
+
+
+def get_response(
+    conn: sqlite3.Connection, site_id: int, version: int
+) -> Optional[str]:
+    """按（遗址, 版号）取回留存的回包；查无回包返回 None。"""
+    row = conn.execute(
+        "SELECT payload FROM response_log WHERE site_id = ? AND version = ?",
+        (site_id, version),
+    ).fetchone()
+    return None if row is None else row["payload"]
